@@ -19,6 +19,7 @@ import (
 	"github.com/github/github-mcp-server/pkg/lockdown"
 	mcplog "github.com/github/github-mcp-server/pkg/log"
 	"github.com/github/github-mcp-server/pkg/raw"
+	"github.com/github/github-mcp-server/pkg/scopes"
 	"github.com/github/github-mcp-server/pkg/translations"
 	gogithub "github.com/google/go-github/v79/github"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -63,10 +64,18 @@ type MCPServerConfig struct {
 	// LockdownMode indicates if we should enable lockdown mode
 	LockdownMode bool
 
+	// Insider indicates if we should enable experimental features
+	InsiderMode bool
+
 	// Logger is used for logging within the server
 	Logger *slog.Logger
 	// RepoAccessTTL overrides the default TTL for repository access cache entries.
 	RepoAccessTTL *time.Duration
+
+	// TokenScopes contains the OAuth scopes available to the token.
+	// When non-nil, tools requiring scopes not in this list will be hidden.
+	// This is used for PAT scope filtering where we can't issue scope challenges.
+	TokenScopes []string
 }
 
 // githubClients holds all the GitHub API clients created for a server instance.
@@ -90,8 +99,10 @@ func createGitHubClients(cfg MCPServerConfig, apiHost apiHost) (*githubClients, 
 	// We use NewEnterpriseClient unconditionally since we already parsed the API host
 	gqlHTTPClient := &http.Client{
 		Transport: &bearerAuthTransport{
-			transport: http.DefaultTransport,
-			token:     cfg.Token,
+			transport: &github.GraphQLFeaturesTransport{
+				Transport: http.DefaultTransport,
+			},
+			token: cfg.Token,
 		},
 	}
 	gqlClient := githubv4.NewEnterpriseClient(apiHost.graphqlURL.String(), gqlHTTPClient)
@@ -192,6 +203,9 @@ func NewMCPServer(cfg MCPServerConfig) (*mcp.Server, error) {
 	ghServer.AddReceivingMiddleware(addGitHubAPIErrorToContext)
 	ghServer.AddReceivingMiddleware(addUserAgentsMiddleware(cfg, clients.rest, clients.gqlHTTP))
 
+	// Create feature checker
+	featureChecker := createFeatureChecker(cfg.EnabledFeatures)
+
 	// Create dependencies for tool handlers
 	deps := github.NewBaseDeps(
 		clients.rest,
@@ -199,8 +213,12 @@ func NewMCPServer(cfg MCPServerConfig) (*mcp.Server, error) {
 		clients.raw,
 		clients.repoAccess,
 		cfg.Translator,
-		github.FeatureFlags{LockdownMode: cfg.LockdownMode},
+		github.FeatureFlags{
+			LockdownMode: cfg.LockdownMode,
+			InsiderMode: cfg.InsiderMode,
+		},
 		cfg.ContentWindowSize,
+		featureChecker,
 	)
 
 	// Inject dependencies into context for all tool handlers
@@ -211,13 +229,22 @@ func NewMCPServer(cfg MCPServerConfig) (*mcp.Server, error) {
 	})
 
 	// Build and register the tool/resource/prompt inventory
-	inventory := github.NewInventory(cfg.Translator).
+	inventoryBuilder := github.NewInventory(cfg.Translator).
 		WithDeprecatedAliases(github.DeprecatedToolAliases).
 		WithReadOnly(cfg.ReadOnly).
 		WithToolsets(enabledToolsets).
-		WithTools(github.CleanTools(cfg.EnabledTools)).
-		WithFeatureChecker(createFeatureChecker(cfg.EnabledFeatures)).
-		Build()
+		WithTools(cfg.EnabledTools).
+		WithFeatureChecker(featureChecker)
+  
+	// Apply token scope filtering if scopes are known (for PAT filtering)
+	if cfg.TokenScopes != nil {
+		inventoryBuilder = inventoryBuilder.WithFilter(github.CreateToolScopeFilter(cfg.TokenScopes))
+	}
+
+	inventory, err := inventoryBuilder.Build()
+	if err != nil {
+		return nil, fmt.Errorf("failed to build inventory: %w", err)
+	}
 
 	if unrecognized := inventory.UnrecognizedToolsets(); len(unrecognized) > 0 {
 		fmt.Fprintf(os.Stderr, "Warning: unrecognized toolsets ignored: %s\n", strings.Join(unrecognized, ", "))
@@ -310,6 +337,9 @@ type StdioServerConfig struct {
 	// LockdownMode indicates if we should enable lockdown mode
 	LockdownMode bool
 
+	// InsiderMode indicates if we should enable experimental features
+	InsiderMode bool
+
 	// RepoAccessCacheTTL overrides the default TTL for repository access cache entries.
 	RepoAccessCacheTTL *time.Duration
 }
@@ -338,6 +368,22 @@ func RunStdioServer(cfg StdioServerConfig) error {
 	logger := slog.New(slogHandler)
 	logger.Info("starting server", "version", cfg.Version, "host", cfg.Host, "dynamicToolsets", cfg.DynamicToolsets, "readOnly", cfg.ReadOnly, "lockdownEnabled", cfg.LockdownMode)
 
+	// Fetch token scopes for scope-based tool filtering (PAT tokens only)
+	// Only classic PATs (ghp_ prefix) return OAuth scopes via X-OAuth-Scopes header.
+	// Fine-grained PATs and other token types don't support this, so we skip filtering.
+	var tokenScopes []string
+	if strings.HasPrefix(cfg.Token, "ghp_") {
+		fetchedScopes, err := fetchTokenScopesForHost(ctx, cfg.Token, cfg.Host)
+		if err != nil {
+			logger.Warn("failed to fetch token scopes, continuing without scope filtering", "error", err)
+		} else {
+			tokenScopes = fetchedScopes
+			logger.Info("token scopes fetched for filtering", "scopes", tokenScopes)
+		}
+	} else {
+		logger.Debug("skipping scope filtering for non-PAT token")
+	}
+
 	ghServer, err := NewMCPServer(MCPServerConfig{
 		Version:           cfg.Version,
 		Host:              cfg.Host,
@@ -350,8 +396,10 @@ func RunStdioServer(cfg StdioServerConfig) error {
 		Translator:        t,
 		ContentWindowSize: cfg.ContentWindowSize,
 		LockdownMode:      cfg.LockdownMode,
+		InsiderMode:       cfg.InsiderMode,
 		Logger:            logger,
 		RepoAccessTTL:     cfg.RepoAccessCacheTTL,
+		TokenScopes:       tokenScopes,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create MCP server: %w", err)
@@ -635,4 +683,19 @@ func addUserAgentsMiddleware(cfg MCPServerConfig, restClient *gogithub.Client, g
 			return next(ctx, method, request)
 		}
 	}
+}
+
+// fetchTokenScopesForHost fetches the OAuth scopes for a token from the GitHub API.
+// It constructs the appropriate API host URL based on the configured host.
+func fetchTokenScopesForHost(ctx context.Context, token, host string) ([]string, error) {
+	apiHost, err := parseAPIHost(host)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse API host: %w", err)
+	}
+
+	fetcher := scopes.NewFetcher(scopes.FetcherOptions{
+		APIHost: apiHost.baseRESTURL.String(),
+	})
+
+	return fetcher.FetchTokenScopes(ctx, token)
 }
